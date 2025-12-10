@@ -11,3 +11,4 @@ venv/
 *.avi
 *.jpg
 *.npy
+*.bak
