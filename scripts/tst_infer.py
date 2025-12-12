@@ -183,9 +183,8 @@ def from_npy(
     frames_dir: Optional[str] = typer.Option(None, help="Folder of frames for this session"),
     layer_paths: List[str] = typer.Option([], help="Repeat per layer: --layer-paths model.18"),
     imgsz: int = typer.Option(640),
-    batch_size: int = typer.Option(1),
-    device: str = typer.Option("cuda"),
-    fp16: bool = typer.Option(True),
+    backbone_batch: int = typer.Option(8, help="Batch size for backbone feature extraction"),
+    half: bool= typer.Option(False, help="Use half precision for backbone"),
     smooth_k: int = typer.Option(7),
     only_uncertain: bool = typer.Option(True),
 ):
@@ -201,108 +200,35 @@ def from_npy(
         if not _HAS_YOLO:
             raise RuntimeError("Ultralytics/YOLO not available; install the extras or omit --yolo-model.")
         # light, single-chunk pass: take largest mask per frame, ROI pool neck features, average per second
-    import cv2, glob as _glob, torch
-
-    # --- config
-    use_cuda = (device == "cuda") and torch.cuda.is_available()
-    dev = torch.device("cuda" if use_cuda else "cpu")
-    use_fp16 = bool(fp16 and use_cuda)
-
-    # load YOLO and grab the nn.Module
-    yolo = YOLO(yolo_model)
-    net = yolo.model.to(dev).eval()
-    if use_fp16:
-        net.half()
-
-    # choose one feature layer (keep it single to save memory)
-    target = net
-    # default to model.18 if none provided
-    sel = (layer_paths or ["model.18"])[0]
-    for name in sel.split(".")[1:]:
-        target = getattr(target, name)
-
-    # collect frame paths
-    frames = sorted(_glob.glob(os.path.join(frames_dir, "*.jpg")) +
-                    _glob.glob(os.path.join(frames_dir, "*.png")))
-    if not frames:
-        raise RuntimeError(f"No frames found in {frames_dir}")
-
-    # seconds bookkeeping
-    win = int(round(win_s * fps))
-    n_frames = len(frames)
-    n_secs = n_frames // win
-
-    feat_dim = None
-    sec_sum = None
-    sec_cnt = np.zeros(n_secs, dtype=np.int32)
-
-    def preprocess(path, size):
-        img = cv2.imread(path)  # BGR uint8
-        if img is None:
-            # robust to read errors
-            img = np.zeros((size, size, 3), np.uint8)
-        img = cv2.resize(img, (size, size), interpolation=cv2.INTER_LINEAR)
-        img = img[:, :, ::-1]  # BGR->RGB
-        x = img.astype(np.float32) / 255.0
-        x = np.transpose(x, (2, 0, 1))  # CHW
-        return x
-
-    # hook that does GAP and CPU-accumulate per-second
-    def make_hook(sec_indices_for_batch):
-        def _hook(_m, _inp, out):
-            with torch.no_grad():
-                # out: [B, C, H, W]
-                feat = out.float().mean(dim=(2, 3))  # GAP -> [B, C]
-                f_cpu = feat.detach().cpu().numpy()
-            nonlocal feat_dim, sec_sum
-            if feat_dim is None:
-                feat_dim = f_cpu.shape[1]
-                sec_sum = np.zeros((n_secs, feat_dim), dtype=np.float32)
-            for i, sidx in enumerate(sec_indices_for_batch):
-                if 0 <= sidx < n_secs:
-                    sec_sum[sidx] += f_cpu[i]
-                    sec_cnt[sidx] += 1
-        return _hook
-
-    # stream frames in tiny batches
-    cur_batch, cur_secs = [], []
-    with torch.inference_mode():
-        for f_idx, fp_ in enumerate(frames[: n_secs * win]):  # drop partial last second
-            cur_batch.append(preprocess(fp_, imgsz))
-            cur_secs.append(f_idx // win)
-
-            if len(cur_batch) == batch_size:
-                x = torch.from_numpy(np.stack(cur_batch))  # [B,3,H,W]
-                x = x.to(dev, non_blocking=True)
-                if use_fp16: x = x.half()
-
-                h = target.register_forward_hook(make_hook(cur_secs))
-                _ = net(x)
-                h.remove()
-
-                del x; cur_batch.clear(); cur_secs.clear()
-                if use_cuda:
-                    torch.cuda.empty_cache()
-
-        # flush last partial batch
-        if cur_batch:
-            x = torch.from_numpy(np.stack(cur_batch)).to(dev, non_blocking=True)
-            if use_fp16: x = x.half()
-            h = target.register_forward_hook(make_hook(cur_secs))
-            _ = net(x)
-            h.remove()
-            del x; cur_batch.clear(); cur_secs.clear()
-            if use_cuda:
-                torch.cuda.empty_cache()
-
-    # finalize per-second features
-    sec_cnt[sec_cnt == 0] = 1
-    bb = sec_sum / sec_cnt[:, None]  # [n_secs, C]
-    bb_cols = [f"bb_{i:04d}" for i in range(bb.shape[1])]
-    bb_df = pd.DataFrame(bb, columns=bb_cols)
-    bb_df.insert(0, "t_start_sec", df["t_start_sec"][:len(bb_df)].values)
-    # keep timeline consistent: trim df to matched seconds, then merge
-    df = df.iloc[:len(bb_df)].merge(bb_df, on="t_start_sec", how="left")
+        yolo = YOLO(yolo_model)
+        feat = UltralyticsSegFeaturizer(yolo, layer_paths=layer_paths or ["model.18"], imgsz=imgsz, device="cuda")
+        import cv2, numpy as np, glob as _glob
+        frames = sorted(_glob.glob(os.path.join(frames_dir, "*.jpg")) + _glob.glob(os.path.join(frames_dir, "*.png")))
+        results = yolo.predict([cv2.imread(f) for f in frames], imgsz=imgsz, stream=True, verbose=False, batch=backbone_batch, half=half)
+        boxes, masks = [], []
+        for r in results:
+            H, W = r.orig_img.shape[:2]
+            if (r.masks is None) or (len(r.boxes) == 0):
+                boxes.append(np.zeros((0,4), np.float32))
+                masks.append(np.zeros((0,H,W), np.uint8)); continue
+            best, area_px = None, -1
+            for m in r.masks.data.cpu().numpy():
+                m_img = cv2.resize((m*255).astype("uint8"), (W,H), interpolation=cv2.INTER_NEAREST)
+                a = int((m_img>127).sum())
+                if a > area_px: area_px, best = a, (m_img>127).astype("uint8")
+            ys, xs = np.where(best>0)
+            x1,y1,x2,y2 = xs.min(), ys.min(), xs.max(), ys.max()
+            boxes.append(np.array([[x1,y1,x2,y2]], np.float32))
+            masks.append(np.expand_dims(best,0).astype(np.uint8))
+        embeds = feat.extract_batch([cv2.imread(f) for f in frames], boxes, masks)  # (T, C)
+        win = int(round(win_s * fps))
+        pooled = [embeds[s:s+win].mean(0) for s in range(0, max(0, len(frames)-win+1), win)]
+        if pooled:
+            bb = np.stack(pooled, axis=0)
+            bb_cols = [f"bb_{i:04d}" for i in range(bb.shape[1])]
+            bb_df = pd.DataFrame(bb, columns=bb_cols)
+            bb_df.insert(0, "t_start_sec", df["t_start_sec"][:len(bb_df)].values)
+            df = df.iloc[:len(bb_df)].merge(bb_df, on="t_start_sec", how="left")
 
     # 3) verifier
     clf = joblib.load(model_path)
