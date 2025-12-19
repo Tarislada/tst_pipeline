@@ -15,6 +15,7 @@ from tst.postprocess import median_smooth  # already imported above
 try:
     from ultralytics import YOLO
     from tst.featurizers.ultra_backbone import UltralyticsSegFeaturizer
+    import torch  # for empty_cache
     _HAS_YOLO = True
 except Exception:
     _HAS_YOLO = False
@@ -178,13 +179,14 @@ def from_npy(
     band: float = typer.Option(0.30),
     beta: float = typer.Option(0.31),
     w_min: float = typer.Option(0.75),
-    # optional backbone
+    # optional backbone (VRAM controls)
     yolo_model: Optional[str] = typer.Option(None, help="Ultralytics seg model path (e.g., best.pt)"),
     frames_dir: Optional[str] = typer.Option(None, help="Folder of frames for this session"),
     layer_paths: List[str] = typer.Option([], help="Repeat per layer: --layer-paths model.18"),
-    imgsz: int = typer.Option(640),
-    backbone_batch: int = typer.Option(8, help="Batch size for backbone feature extraction"),
-    half: bool= typer.Option(False, help="Use half precision for backbone"),
+    imgsz: int = typer.Option(512, help="YOLO inference size (lower to save VRAM)"),
+    backbone_batch: int = typer.Option(2, help="Batch size for backbone feature extraction"),
+    device: str = typer.Option("cuda", help="YOLO device, e.g. cuda, cuda:0, cpu"),
+    half: bool = typer.Option(True, help="Use half precision for backbone to save VRAM"),
     smooth_k: int = typer.Option(7),
     only_uncertain: bool = typer.Option(True),
 ):
@@ -195,40 +197,66 @@ def from_npy(
                                beta=beta, w_min=w_min, norm_within_video=True, add_lowfreq_power=True)
     df = apply_rule_and_uncertainty(df, threshold=threshold, band=band)
 
-    # 2) optional backbone
+    # 2) optional backbone (streamed, low-VRAM)
     if yolo_model and frames_dir:
         if not _HAS_YOLO:
             raise RuntimeError("Ultralytics/YOLO not available; install the extras or omit --yolo-model.")
-        # light, single-chunk pass: take largest mask per frame, ROI pool neck features, average per second
         yolo = YOLO(yolo_model)
-        feat = UltralyticsSegFeaturizer(yolo, layer_paths=layer_paths or ["model.18"], imgsz=imgsz, device="cuda")
+        feat = UltralyticsSegFeaturizer(
+            yolo,
+            layer_paths=layer_paths or ["model.18"],
+            imgsz=imgsz,
+            device=device,
+        )
         import cv2, numpy as np, glob as _glob
-        frames = sorted(_glob.glob(os.path.join(frames_dir, "*.jpg")) + _glob.glob(os.path.join(frames_dir, "*.png")))
-        results = yolo.predict([cv2.imread(f) for f in frames], imgsz=imgsz, stream=True, verbose=False, batch=backbone_batch, half=half)
-        boxes, masks = [], []
-        for r in results:
-            H, W = r.orig_img.shape[:2]
-            if (r.masks is None) or (len(r.boxes) == 0):
-                boxes.append(np.zeros((0,4), np.float32))
-                masks.append(np.zeros((0,H,W), np.uint8)); continue
-            best, area_px = None, -1
-            for m in r.masks.data.cpu().numpy():
-                m_img = cv2.resize((m*255).astype("uint8"), (W,H), interpolation=cv2.INTER_NEAREST)
-                a = int((m_img>127).sum())
-                if a > area_px: area_px, best = a, (m_img>127).astype("uint8")
-            ys, xs = np.where(best>0)
-            x1,y1,x2,y2 = xs.min(), ys.min(), xs.max(), ys.max()
-            boxes.append(np.array([[x1,y1,x2,y2]], np.float32))
-            masks.append(np.expand_dims(best,0).astype(np.uint8))
-        embeds = feat.extract_batch([cv2.imread(f) for f in frames], boxes, masks)  # (T, C)
-        win = int(round(win_s * fps))
-        pooled = [embeds[s:s+win].mean(0) for s in range(0, max(0, len(frames)-win+1), win)]
-        if pooled:
-            bb = np.stack(pooled, axis=0)
-            bb_cols = [f"bb_{i:04d}" for i in range(bb.shape[1])]
-            bb_df = pd.DataFrame(bb, columns=bb_cols)
-            bb_df.insert(0, "t_start_sec", df["t_start_sec"][:len(bb_df)].values)
-            df = df.iloc[:len(bb_df)].merge(bb_df, on="t_start_sec", how="left")
+        frame_paths = sorted(_glob.glob(os.path.join(frames_dir, "*.jpg")) + _glob.glob(os.path.join(frames_dir, "*.png")))
+        embeds_chunks = []
+        for i in range(0, len(frame_paths), backbone_batch):
+            batch_paths = frame_paths[i:i + backbone_batch]
+            imgs = [cv2.imread(p) for p in batch_paths]
+            # stream=False returns a list for this batch only
+            results = yolo.predict(
+                batch_paths,
+                imgsz=imgsz,
+                stream=False,
+                verbose=False,
+                batch=backbone_batch,
+                device=device,
+                half=half,
+            )
+            boxes, masks = [], []
+            for r, img in zip(results, imgs):
+                H, W = img.shape[:2]
+                if (r.masks is None) or (len(r.boxes) == 0):
+                    boxes.append(np.zeros((0, 4), np.float32))
+                    masks.append(np.zeros((0, H, W), np.uint8))
+                    continue
+                best, area_px = None, -1
+                for m in r.masks.data.cpu().numpy():
+                    m_img = cv2.resize((m * 255).astype("uint8"), (W, H), interpolation=cv2.INTER_NEAREST)
+                    a = int((m_img > 127).sum())
+                    if a > area_px:
+                        area_px, best = a, (m_img > 127).astype("uint8")
+                ys, xs = np.where(best > 0)
+                x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
+                boxes.append(np.array([[x1, y1, x2, y2]], np.float32))
+                masks.append(np.expand_dims(best, 0).astype(np.uint8))
+            batch_embeds = feat.extract_batch(imgs, boxes, masks)  # (B, C)
+            embeds_chunks.append(batch_embeds)
+            # free GPU/CPU memory
+            del results, imgs, batch_embeds
+            if "torch" in globals():
+                torch.cuda.empty_cache()
+        if embeds_chunks:
+            embeds = np.concatenate(embeds_chunks, axis=0)
+            win = int(round(win_s * fps))
+            pooled = [embeds[s:s + win].mean(0) for s in range(0, max(0, len(embeds) - win + 1), win)]
+            if pooled:
+                bb = np.stack(pooled, axis=0)
+                bb_cols = [f"bb_{i:04d}" for i in range(bb.shape[1])]
+                bb_df = pd.DataFrame(bb, columns=bb_cols)
+                bb_df.insert(0, "t_start_sec", df["t_start_sec"][:len(bb_df)].values)
+                df = df.iloc[:len(bb_df)].merge(bb_df, on="t_start_sec", how="left")
 
     # 3) verifier
     clf = joblib.load(model_path)
@@ -251,7 +279,10 @@ def from_npy_batch(
     frames_root: Optional[str] = typer.Option(None, help="Root folder containing <base>_images/ if adding backbone"),
     yolo_model: Optional[str] = typer.Option(None, help="Ultralytics seg model"),
     layer_paths: List[str] = typer.Option([], help="Repeat per layer hook"),
-    imgsz: int = typer.Option(640),
+    imgsz: int = typer.Option(512),
+    backbone_batch: int = typer.Option(2),
+    device: str = typer.Option("cuda"),
+    half: bool = typer.Option(True),
     smooth_k: int = typer.Option(7),
     only_uncertain: bool = typer.Option(True),
 ):
@@ -272,6 +303,7 @@ def from_npy_batch(
             npy_path=p, model_path=model_path, out_csv=out_csv,
             fps=fps, win_s=win_s, threshold=threshold, band=band, beta=beta, w_min=w_min,
             yolo_model=yolo_model, frames_dir=frames_dir, layer_paths=layer_paths, imgsz=imgsz,
+            backbone_batch=backbone_batch, device=device, half=half,
             smooth_k=smooth_k, only_uncertain=only_uncertain
         )
 
